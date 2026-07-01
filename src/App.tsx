@@ -464,7 +464,7 @@ export default function App() {
       <!DOCTYPE html>
       <html>
         <head>
-          <title>建物写真台帳 - 印刷プレビュー</title>
+          <title>写真</title>
           <script src="https://cdn.tailwindcss.com"><${""}/script>
           <style>
             @page { size: A4 portrait; margin: 15mm; }
