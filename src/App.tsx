@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   closestCenter,
   DndContext,
@@ -18,6 +18,7 @@ import {
   ArrowDown,
   ArrowUp,
   Download,
+  FolderDown,
   Image as ImageIcon,
   Merge,
   Plus,
@@ -43,6 +44,7 @@ import {
   createCaption,
   createInteriorGroup,
   getBuildingGroupLabel,
+  getDefaultGroupName,
   prioritizeAttentionPhotos,
   resolvePhotoCaption,
 } from './utils/photoClassifier';
@@ -53,6 +55,8 @@ import {
   keepSpecialStructurePairsAdjacent,
   updateSpecialStructureInclusion,
 } from './utils/specialStructure';
+import { readHandoffRef, receiveFromSurvia, savePdfToSurvia, stripHandoffRef } from './utils/surviaHandoff';
+import type { SurviaRef } from './utils/surviaHandoff';
 
 const getAlphabet = (index: number) => {
   let result = '';
@@ -181,32 +185,72 @@ export default function App() {
     });
   };
 
+  // SURVIA から開かれたときの受け渡し口（写真.pdf を案件へ保存するのに使う）
+  const [survia, setSurvia] = useState<SurviaRef | null>(null);
+  const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  const surviaStarted = useRef(false);
+
+  const addFiles = async (files: File[]) => {
+    const newPhotos = await Promise.all(files.map(async (file): Promise<Photo> => ({
+      id: crypto.randomUUID(),
+      url: await compressImage(file),
+      originalFileName: file.name,
+      rotation: 0,
+      ...classifyPhotoFileName(file.name),
+    })));
+    const newExterior = newPhotos.filter((photo) => photo.category === 'exterior');
+    const newInterior = newPhotos.filter((photo) => photo.category === 'interior');
+    const newUnclassified = newPhotos.filter((photo) => photo.category === 'unclassified');
+    const allInterior = [...interiorPhotos, ...newInterior];
+
+    setExteriorPhotos((current) => [...current, ...newExterior].sort(compareExteriorPhotos));
+    setInteriorPhotos(allInterior);
+    setUnclassifiedPhotos((current) => prioritizeAttentionPhotos([
+      ...current,
+      ...newUnclassified,
+    ]));
+    setGroups((current) => assignNewPhotosToGroups(current, newInterior, allInterior));
+    setSpecialStructurePairs((current) => buildSpecialStructurePairs(allInterior, current));
+  };
+
+  useEffect(() => {
+    const ref = readHandoffRef(window.location.hash);
+    if (!ref || surviaStarted.current) return;
+    surviaStarted.current = true;
+    // 受け渡し口の場所はすぐ URL から消す（履歴・ブックマークに残さない）
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${stripHandoffRef(window.location.hash)}`);
+    setSurvia(ref);
+    setProcessingMessage('SURVIA から写真を受け取っています...');
+    void (async () => {
+      try {
+        const { groups: names, files } = await receiveFromSurvia(ref, (done, total) => setProcessingMessage(`SURVIA から写真を受け取っています...（${done}/${total}）`));
+        setProcessingMessage('写真を分類・処理しています...');
+        await addFiles(files);
+        // 建物の種類をグループ名に（既定の名前のままのグループだけ）
+        const byGroup = new Map(names.map((g) => [g.buildingGroup, g.name]));
+        setGroups((current) => current.map((group) => {
+          const name = group.buildingGroup === null ? undefined : byGroup.get(group.buildingGroup);
+          return name && group.name === getDefaultGroupName(group.buildingGroup) ? { ...group, name } : group;
+        }));
+        setNotice({ ok: true, text: `SURVIA から ${files.length} 枚` });
+      } catch (error) {
+        console.error('SURVIA からの受け取りに失敗しました:', error);
+        setNotice({ ok: false, text: error instanceof Error ? error.message : 'SURVIA から受け取れませんでした' });
+      } finally {
+        setProcessingMessage(null);
+      }
+    })();
+    // 開いたときに1回だけ
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleAddPhotos = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
     if (files.length === 0) return;
 
     setProcessingMessage('写真を分類・処理しています...');
     try {
-      const newPhotos = await Promise.all(files.map(async (file): Promise<Photo> => ({
-        id: crypto.randomUUID(),
-        url: await compressImage(file),
-        originalFileName: file.name,
-        rotation: 0,
-        ...classifyPhotoFileName(file.name),
-      })));
-      const newExterior = newPhotos.filter((photo) => photo.category === 'exterior');
-      const newInterior = newPhotos.filter((photo) => photo.category === 'interior');
-      const newUnclassified = newPhotos.filter((photo) => photo.category === 'unclassified');
-      const allInterior = [...interiorPhotos, ...newInterior];
-
-      setExteriorPhotos((current) => [...current, ...newExterior].sort(compareExteriorPhotos));
-      setInteriorPhotos(allInterior);
-      setUnclassifiedPhotos((current) => prioritizeAttentionPhotos([
-        ...current,
-        ...newUnclassified,
-      ]));
-      setGroups((current) => assignNewPhotosToGroups(current, newInterior, allInterior));
-      setSpecialStructurePairs((current) => buildSpecialStructurePairs(allInterior, current));
+      await addFiles(files);
     } catch (error) {
       console.error('画像の処理中にエラーが発生しました:', error);
       window.alert('画像の読み込みに失敗しました。');
@@ -445,6 +489,22 @@ export default function App() {
     }
   };
 
+  const handleSaveToSurvia = async () => {
+    if (!survia || (exteriorData.length === 0 && interiorData.length === 0)) return;
+    setProcessingMessage('写真.pdfを案件へ保存しています...');
+    setNotice(null);
+    try {
+      const { generatePhotoPdf } = await import('./utils/pdfGenerator');
+      const name = await savePdfToSurvia(survia, await generatePhotoPdf(exteriorData, interiorData));
+      setNotice({ ok: true, text: `${name} を保存しました` });
+    } catch (error) {
+      console.error('案件への保存に失敗しました:', error);
+      setNotice({ ok: false, text: error instanceof Error ? error.message : '保存できませんでした' });
+    } finally {
+      setProcessingMessage(null);
+    }
+  };
+
   const renderPhotoGrid = (
     photos: PhotoWithCaption[],
     category: PhotoCategory,
@@ -515,6 +575,21 @@ export default function App() {
               <Download size={18} />
               PDFを出力
             </button>
+          )}
+          {survia && (exteriorPhotos.length > 0 || interiorPhotos.length > 0) && (
+            <button
+              type="button"
+              onClick={() => { void handleSaveToSurvia(); }}
+              disabled={Boolean(processingMessage)}
+              title="写真.pdf を SURVIA の案件のフォルダへ保存"
+              className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-4 py-2 rounded-md font-medium transition-colors shadow-sm"
+            >
+              <FolderDown size={18} />
+              案件へ保存
+            </button>
+          )}
+          {notice && (
+            <span role="status" className={`text-sm ${notice.ok ? 'text-slate-500' : 'text-red-600'}`}>{notice.text}</span>
           )}
         </div>
       </header>
